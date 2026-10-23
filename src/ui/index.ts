@@ -25,6 +25,209 @@ export interface QuickPromptChip {
     title: string;
 }
 
+export interface ReasoningLevelDescriptor {
+    level: AiReasoningLevel;
+    title: string;
+    desc: string;
+    badge: string;
+    shortLabel?: string;
+}
+
+export const DEFAULT_REASONING_LEVEL_OPTIONS: ReasoningLevelDescriptor[] = [
+    {
+        level: "low",
+        title: "Low Reasoning",
+        desc: "Quick thinking for fast single-tool edits & inspections",
+        badge: "LOW",
+        shortLabel: "Low"
+    },
+    {
+        level: "medium",
+        title: "Medium Reasoning",
+        desc: "Balanced multi-step planning for layers, vectors & filters",
+        badge: "MED",
+        shortLabel: "Med"
+    },
+    {
+        level: "max",
+        title: "Max Reasoning",
+        desc: "Deepest artistic & architectural thinking for complex scenes",
+        badge: "MAX",
+        shortLabel: "Max"
+    }
+];
+
+export interface AiReasoningControlsWidgetOptions {
+    doc?: Document;
+    defaultReasoningLevel?: AiReasoningLevel;
+    reasoningLevels?: ReasoningLevelDescriptor[];
+    onSendFast?: () => void;
+    onSendWithReasoning?: (level: AiReasoningLevel) => void;
+    onReasoningLevelChange?: (level: AiReasoningLevel) => void;
+    onAbort?: () => void;
+}
+
+/**
+ * Standalone reusable UI widget for optional varied reasoning levels (`"none"` Fast Send `➡️` +
+ * `"low" | "medium" | "max"` Brain `🧠` dropdown selector), matching HAEditor's reasoning UX.
+ * Can be mounted inside any custom chat footer or prompt bar.
+ */
+export class AiReasoningControlsWidget {
+    public selectedReasoningLevel: AiReasoningLevel;
+    public isStreaming = false;
+    private isDropdownOpen = false;
+    private readonly options: AiReasoningControlsWidgetOptions;
+
+    public sendBtnEl!: HTMLButtonElement;
+    public brainWrapEl!: HTMLElement;
+    public brainBtnEl!: HTMLButtonElement;
+    public brainDropdownEl!: HTMLElement;
+
+    constructor(options: AiReasoningControlsWidgetOptions = {}) {
+        this.options = options;
+        this.selectedReasoningLevel = options.defaultReasoningLevel || "medium";
+    }
+
+    private get doc(): Document {
+        return this.options.doc || document;
+    }
+
+    public mount(containerEl: HTMLElement): void {
+        this.sendBtnEl = this.doc.createElement("button");
+        this.sendBtnEl.className = "ha-btn ha-btn-primary ha-ai-send-btn";
+        this.sendBtnEl.id = "ha-ai-send-btn";
+        this.sendBtnEl.type = "button";
+        this.sendBtnEl.textContent = "➡️";
+        this.sendBtnEl.title = "Fast Send (Non-Reasoning Mode — Enter)";
+        this.sendBtnEl.addEventListener("click", () => {
+            if (this.isStreaming) {
+                this.options.onAbort?.();
+            } else {
+                this.options.onSendFast?.();
+            }
+        });
+
+        this.brainWrapEl = this.doc.createElement("div");
+        this.brainWrapEl.className = "ha-ai-brain-wrap";
+
+        this.brainBtnEl = this.doc.createElement("button");
+        this.brainBtnEl.className = "ha-btn ha-btn-secondary ha-ai-brain-btn";
+        this.brainBtnEl.id = "ha-ai-brain-btn";
+        this.brainBtnEl.type = "button";
+        this.brainBtnEl.title = "Click to choose Reasoning Level (Low, Medium, Max) & Send with Reasoning";
+        this.updateBrainButtonLabel();
+
+        this.brainDropdownEl = this.doc.createElement("div");
+        this.brainDropdownEl.className = "ha-ai-brain-dropdown";
+        this.brainDropdownEl.id = "ha-ai-brain-dropdown";
+        this.brainDropdownEl.style.display = "none";
+        this.renderBrainDropdownItems();
+
+        this.brainBtnEl.addEventListener("click", (e) => {
+            e.stopPropagation();
+            if (this.isStreaming) {
+                this.options.onAbort?.();
+                return;
+            }
+            this.toggleBrainDropdown();
+        });
+
+        this.doc.addEventListener("click", (e) => {
+            if (this.isDropdownOpen && !this.brainWrapEl.contains(e.target as Node)) {
+                this.closeBrainDropdown();
+            }
+        });
+
+        this.brainWrapEl.append(this.brainBtnEl, this.brainDropdownEl);
+        containerEl.append(this.sendBtnEl, this.brainWrapEl);
+    }
+
+    public setStreamingState(streaming: boolean): void {
+        this.isStreaming = streaming;
+        if (this.sendBtnEl) {
+            this.sendBtnEl.textContent = streaming ? "⏹" : "➡️";
+            this.sendBtnEl.title = streaming ? "Stop AI Generation" : "Fast Send (Non-Reasoning Mode — Enter)";
+        }
+        this.updateBrainButtonLabel();
+    }
+
+    public updateBrainButtonLabel(): void {
+        if (!this.brainBtnEl) return;
+        if (this.isStreaming) {
+            this.brainBtnEl.textContent = "⏹";
+            this.brainBtnEl.title = "Stop AI Generation";
+            return;
+        }
+        const levels = this.options.reasoningLevels || DEFAULT_REASONING_LEVEL_OPTIONS;
+        const found = levels.find(l => l.level === this.selectedReasoningLevel);
+        const shortLabel =
+            found?.shortLabel ||
+            (this.selectedReasoningLevel === "low"
+                ? "Low"
+                : this.selectedReasoningLevel === "medium"
+                  ? "Med"
+                  : "Max");
+        this.brainBtnEl.innerHTML = `🧠 <span class="ha-ai-brain-level-tag">${shortLabel}</span> ▾`;
+    }
+
+    public toggleBrainDropdown(): void {
+        this.isDropdownOpen = !this.isDropdownOpen;
+        this.brainDropdownEl.style.display = this.isDropdownOpen ? "flex" : "none";
+        if (this.isDropdownOpen) {
+            this.renderBrainDropdownItems();
+        }
+    }
+
+    public closeBrainDropdown(): void {
+        this.isDropdownOpen = false;
+        if (this.brainDropdownEl) {
+            this.brainDropdownEl.style.display = "none";
+        }
+    }
+
+    private renderBrainDropdownItems(): void {
+        if (!this.brainDropdownEl) return;
+        this.brainDropdownEl.innerHTML = "";
+
+        const header = this.doc.createElement("div");
+        header.className = "ha-ai-brain-dropdown-title";
+        header.textContent = "🧠 Reasoning Mode Level (Click to Select & Send)";
+        this.brainDropdownEl.appendChild(header);
+
+        const levels = this.options.reasoningLevels || DEFAULT_REASONING_LEVEL_OPTIONS;
+        for (const item of levels) {
+            const isSelected = this.selectedReasoningLevel === item.level;
+            const optBtn = this.doc.createElement("button");
+            optBtn.className = `ha-ai-brain-option ${isSelected ? "active" : ""}`;
+            optBtn.id = `ha-ai-reasoning-${item.level}`;
+            optBtn.type = "button";
+            optBtn.setAttribute("data-reasoning-level", item.level);
+            optBtn.innerHTML = `
+                <div class="ha-ai-brain-opt-top">
+                    <span class="ha-ai-brain-opt-name">${isSelected ? "✓ " : ""}${item.title}</span>
+                    <span class="ha-ai-brain-opt-badge level-${item.level}">${item.badge}</span>
+                </div>
+                <div class="ha-ai-brain-opt-desc">${item.desc}</div>
+            `;
+            optBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                this.selectReasoningLevel(item.level, true);
+            });
+            this.brainDropdownEl.appendChild(optBtn);
+        }
+    }
+
+    public selectReasoningLevel(level: AiReasoningLevel, triggerSend = true): void {
+        this.selectedReasoningLevel = level;
+        this.options.onReasoningLevelChange?.(level);
+        this.updateBrainButtonLabel();
+        this.closeBrainDropdown();
+        if (triggerSend && !this.isStreaming) {
+            this.options.onSendWithReasoning?.(level);
+        }
+    }
+}
+
 export interface AiLiveChatControllerOptions<TContext = any> {
     doc?: Document;
     state: TContext;
@@ -38,6 +241,15 @@ export interface AiLiveChatControllerOptions<TContext = any> {
     starterPrompts?: QuickPromptChip[];
     welcomeTitle?: string;
     inputPlaceholder?: string;
+    /**
+     * Whether to render the Brain (`🧠`) varied reasoning level dropdown (`low`, `medium`, `max`)
+     * alongside the Fast Send (`➡️`) button. Defaults to `true`.
+     */
+    enableReasoningControls?: boolean;
+    /**
+     * Optional custom reasoning level descriptors for the Brain (`🧠`) dropdown.
+     */
+    reasoningLevels?: ReasoningLevelDescriptor[];
     defaultReasoningLevel?: AiReasoningLevel;
     onReasoningLevelChange?: (level: AiReasoningLevel) => void;
     onAfterToolExecuted?: (toolName: string, args: Record<string, any>, result: any) => void;
@@ -71,6 +283,7 @@ export class AiLiveChatController<TContext = any> {
     public chatContainerEl!: HTMLElement;
     public inputEl!: HTMLInputElement;
     public sendBtnEl!: HTMLButtonElement;
+    public brainWrapEl!: HTMLElement;
     public brainBtnEl!: HTMLButtonElement;
     public brainDropdownEl!: HTMLElement;
 
@@ -214,7 +427,7 @@ export class AiLiveChatController<TContext = any> {
             }
         });
 
-        const brainWrap = this.createElement("div", "ha-ai-brain-wrap");
+        this.brainWrapEl = this.createElement("div", "ha-ai-brain-wrap");
         this.brainBtnEl = this.createElement("button", "ha-btn ha-btn-secondary ha-ai-brain-btn", "", {
             id: "ha-ai-brain-btn",
             type: "button",
@@ -238,13 +451,16 @@ export class AiLiveChatController<TContext = any> {
         });
 
         this.doc.addEventListener("click", (e) => {
-            if (this.isDropdownOpen && !brainWrap.contains(e.target as Node)) {
+            if (this.isDropdownOpen && !this.brainWrapEl.contains(e.target as Node)) {
                 this.closeBrainDropdown();
             }
         });
 
-        brainWrap.append(this.brainBtnEl, this.brainDropdownEl);
-        footerEl.append(this.inputEl, this.sendBtnEl, brainWrap);
+        this.brainWrapEl.append(this.brainBtnEl, this.brainDropdownEl);
+        if (this.options.enableReasoningControls === false) {
+            this.brainWrapEl.style.display = "none";
+        }
+        footerEl.append(this.inputEl, this.sendBtnEl, this.brainWrapEl);
         wrapper.appendChild(footerEl);
 
         bodyEl.appendChild(wrapper);
@@ -292,26 +508,7 @@ export class AiLiveChatController<TContext = any> {
         );
         this.brainDropdownEl.appendChild(header);
 
-        const levels: Array<{ level: AiReasoningLevel; title: string; desc: string; badge: string }> = [
-            {
-                level: "low",
-                title: "Low Reasoning",
-                desc: "Quick thinking for fast single-tool edits & inspections",
-                badge: "LOW"
-            },
-            {
-                level: "medium",
-                title: "Medium Reasoning",
-                desc: "Balanced multi-step planning for layers, vectors & filters",
-                badge: "MED"
-            },
-            {
-                level: "max",
-                title: "Max Reasoning",
-                desc: "Deepest artistic & architectural thinking for complex scenes",
-                badge: "MAX"
-            }
-        ];
+        const levels = this.options.reasoningLevels || DEFAULT_REASONING_LEVEL_OPTIONS;
 
         for (const item of levels) {
             const isSelected = this.selectedReasoningLevel === item.level;

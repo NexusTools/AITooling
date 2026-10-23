@@ -106,6 +106,79 @@ export interface ProviderResponse {
 
 export type TokenCallback = (token: string) => void;
 
+export interface ProviderPromptOptions {
+    /**
+     * Optional reasoning level override for this request (`"none" | "low" | "medium" | "max"`).
+     * When omitted, falls back to the `:level` suffix on `model` or `provider.getReasoningMode()`.
+     */
+    reasoningMode?: AiReasoningMode;
+    /**
+     * Optional callback invoked live as reasoning/thinking tokens stream in.
+     */
+    onReasoningToken?: TokenCallback;
+}
+
+export interface ResolvedReasoningConfig {
+    mode: AiReasoningMode;
+    openaiEffort?: "low" | "medium" | "high";
+    claudeThinking?: { type: "enabled"; budget_tokens: number } | { type: "adaptive" };
+    geminiThinkingLevel?: string;
+    geminiThinkingBudget?: number;
+    maxReasoningTokens?: number;
+}
+
+/**
+ * Normalizes optional reasoning modes (`"none"`, `"low"`, `"medium"`, `"max"`, `"high"`, `"adaptive"`)
+ * into provider-specific parameters for OpenAI, Claude, Gemini, Grok, and LM Studio.
+ */
+export function resolveReasoningConfig(rawMode?: AiReasoningMode | string): ResolvedReasoningConfig {
+    const cleaned = (rawMode || "").toLowerCase().trim();
+    if (!cleaned || cleaned === "none") {
+        return {
+            mode: "none",
+            maxReasoningTokens: 0
+        };
+    }
+    if (cleaned === "adaptive") {
+        return {
+            mode: "medium",
+            openaiEffort: "medium",
+            claudeThinking: { type: "adaptive" },
+            geminiThinkingLevel: "medium",
+            geminiThinkingBudget: 2048,
+            maxReasoningTokens: 2048
+        };
+    }
+    if (cleaned === "low") {
+        return {
+            mode: "low",
+            openaiEffort: "low",
+            claudeThinking: { type: "enabled", budget_tokens: 1024 },
+            geminiThinkingLevel: "low",
+            geminiThinkingBudget: 1024,
+            maxReasoningTokens: 1024
+        };
+    }
+    if (cleaned === "max" || cleaned === "high") {
+        return {
+            mode: "max",
+            openaiEffort: "high",
+            claudeThinking: { type: "enabled", budget_tokens: 4096 },
+            geminiThinkingLevel: "high",
+            geminiThinkingBudget: 4096,
+            maxReasoningTokens: 4096
+        };
+    }
+    return {
+        mode: "medium",
+        openaiEffort: "medium",
+        claudeThinking: { type: "enabled", budget_tokens: 2048 },
+        geminiThinkingLevel: "medium",
+        geminiThinkingBudget: 2048,
+        maxReasoningTokens: 2048
+    };
+}
+
 export abstract class BaseAIProvider {
     abstract readonly providerId: string;
     abstract readonly model: string;
@@ -114,13 +187,32 @@ export abstract class BaseAIProvider {
     protected accumulatedOutputTokens = 0;
     protected accumulatedCostUSD = 0;
     protected customPricing?: Record<string, ModelPricing>;
+    protected defaultReasoningMode?: AiReasoningMode;
 
-    constructor(customPricing?: Record<string, ModelPricing>) {
+    constructor(customPricing?: Record<string, ModelPricing>, defaultReasoningMode?: AiReasoningMode) {
         this.customPricing = customPricing;
+        this.defaultReasoningMode = defaultReasoningMode;
     }
 
-    abstract prompt(history: ChatHistoryItem[], userPrompt: string): Promise<ProviderResponse>;
-    abstract promptStream(history: ChatHistoryItem[], userPrompt: string, onToken: TokenCallback): Promise<ProviderResponse>;
+    public setReasoningMode(mode?: AiReasoningMode): void {
+        this.defaultReasoningMode = mode;
+    }
+
+    public getReasoningMode(): AiReasoningMode | undefined {
+        return this.defaultReasoningMode;
+    }
+
+    protected getEffectiveReasoning(modelSuffix?: string, options?: ProviderPromptOptions): ResolvedReasoningConfig {
+        return resolveReasoningConfig(options?.reasoningMode || modelSuffix || this.defaultReasoningMode);
+    }
+
+    abstract prompt(history: ChatHistoryItem[], userPrompt: string, options?: ProviderPromptOptions): Promise<ProviderResponse>;
+    abstract promptStream(
+        history: ChatHistoryItem[],
+        userPrompt: string,
+        onToken: TokenCallback,
+        options?: ProviderPromptOptions
+    ): Promise<ProviderResponse>;
 
     protected recordUsage(inputTokens: number, outputTokens: number): CostCalculation {
         const costCalc = CostCalculator.calculateCost(this.model, inputTokens, outputTokens, this.customPricing);
@@ -182,8 +274,9 @@ export class OpenAIProvider extends BaseAIProvider {
         });
     }
 
-    async prompt(history: ChatHistoryItem[], userPrompt: string): Promise<ProviderResponse> {
+    async prompt(history: ChatHistoryItem[], userPrompt: string, options?: ProviderPromptOptions): Promise<ProviderResponse> {
         const [actualModel, thinkingEffort] = this.model.split(":");
+        const reasoning = this.getEffectiveReasoning(thinkingEffort, options);
         const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
 
         for (const item of history) {
@@ -198,9 +291,9 @@ export class OpenAIProvider extends BaseAIProvider {
             messages
         };
 
-        if (thinkingEffort && thinkingEffort !== "none") {
-            payload.reasoning = { effort: thinkingEffort };
-            payload.reasoning_effort = thinkingEffort;
+        if (reasoning.openaiEffort) {
+            payload.reasoning = { effort: reasoning.openaiEffort };
+            payload.reasoning_effort = reasoning.openaiEffort;
         }
 
         const response = await this.client.chat.completions.create(payload);
@@ -218,8 +311,14 @@ export class OpenAIProvider extends BaseAIProvider {
         };
     }
 
-    async promptStream(history: ChatHistoryItem[], userPrompt: string, onToken: TokenCallback): Promise<ProviderResponse> {
+    async promptStream(
+        history: ChatHistoryItem[],
+        userPrompt: string,
+        onToken: TokenCallback,
+        options?: ProviderPromptOptions
+    ): Promise<ProviderResponse> {
         const [actualModel, thinkingEffort] = this.model.split(":");
+        const reasoning = this.getEffectiveReasoning(thinkingEffort, options);
         const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
 
         for (const item of history) {
@@ -236,8 +335,8 @@ export class OpenAIProvider extends BaseAIProvider {
             stream_options: { include_usage: true }
         };
 
-        if (thinkingEffort && thinkingEffort !== "none") {
-            payload.reasoning_effort = thinkingEffort;
+        if (reasoning.openaiEffort) {
+            payload.reasoning_effort = reasoning.openaiEffort;
         }
 
         const stream = await this.client.chat.completions.create(payload) as unknown as AsyncIterable<OpenAI.Chat.ChatCompletionChunk>;
@@ -247,7 +346,12 @@ export class OpenAIProvider extends BaseAIProvider {
         let outputTokens = 0;
 
         for await (const chunk of stream) {
-            const content = chunk.choices[0]?.delta?.content || "";
+            const delta: any = chunk.choices[0]?.delta;
+            const reasoningChunk = delta?.reasoning_content || delta?.reasoning || delta?.thought || "";
+            if (reasoningChunk && options?.onReasoningToken) {
+                options.onReasoningToken(reasoningChunk);
+            }
+            const content = delta?.content || "";
             if (content) {
                 fullText += content;
                 onToken(content);
@@ -313,8 +417,9 @@ export class ClaudeProvider extends BaseAIProvider {
         });
     }
 
-    async prompt(history: ChatHistoryItem[], userPrompt: string): Promise<ProviderResponse> {
+    async prompt(history: ChatHistoryItem[], userPrompt: string, options?: ProviderPromptOptions): Promise<ProviderResponse> {
         const [actualModel, thinkingMode] = this.model.split(":");
+        const reasoning = this.getEffectiveReasoning(thinkingMode, options);
         let systemPrompt = "";
         const messages: Anthropic.MessageParam[] = [];
 
@@ -336,10 +441,8 @@ export class ClaudeProvider extends BaseAIProvider {
             messages
         };
 
-        if (thinkingMode === "adaptive") {
-            payload.thinking = { type: "adaptive" };
-        } else if (thinkingMode && thinkingMode !== "none") {
-            payload.thinking = { type: "enabled", budget_tokens: 2048 };
+        if (reasoning.claudeThinking) {
+            payload.thinking = reasoning.claudeThinking;
         }
 
         const response = await this.client.messages.create(payload);
@@ -357,8 +460,14 @@ export class ClaudeProvider extends BaseAIProvider {
         };
     }
 
-    async promptStream(history: ChatHistoryItem[], userPrompt: string, onToken: TokenCallback): Promise<ProviderResponse> {
+    async promptStream(
+        history: ChatHistoryItem[],
+        userPrompt: string,
+        onToken: TokenCallback,
+        options?: ProviderPromptOptions
+    ): Promise<ProviderResponse> {
         const [actualModel, thinkingMode] = this.model.split(":");
+        const reasoning = this.getEffectiveReasoning(thinkingMode, options);
         let systemPrompt = "";
         const messages: Anthropic.MessageParam[] = [];
 
@@ -381,10 +490,8 @@ export class ClaudeProvider extends BaseAIProvider {
             stream: true
         };
 
-        if (thinkingMode === "adaptive") {
-            payload.thinking = { type: "adaptive" };
-        } else if (thinkingMode && thinkingMode !== "none") {
-            payload.thinking = { type: "enabled", budget_tokens: 2048 };
+        if (reasoning.claudeThinking) {
+            payload.thinking = reasoning.claudeThinking;
         }
 
         const stream = await this.client.messages.stream(payload);
@@ -394,7 +501,10 @@ export class ClaudeProvider extends BaseAIProvider {
         let outputTokens = 0;
 
         for await (const event of stream) {
-            if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+            const ev: any = event;
+            if (ev.type === "content_block_delta" && ev.delta?.type === "thinking_delta" && ev.delta.thinking) {
+                options?.onReasoningToken?.(ev.delta.thinking);
+            } else if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
                 fullText += event.delta.text;
                 onToken(event.delta.text);
             } else if (event.type === "message_start") {
@@ -469,8 +579,10 @@ export class GeminiProvider extends BaseAIProvider {
         }
     }
 
-    async prompt(history: ChatHistoryItem[], userPrompt: string): Promise<ProviderResponse> {
+    async prompt(history: ChatHistoryItem[], userPrompt: string, options?: ProviderPromptOptions): Promise<ProviderResponse> {
         const [actualModel, thinkingLevel] = this.model.split(":");
+        const reasoning = this.getEffectiveReasoning(thinkingLevel, options);
+        const effectiveThinkingLevel = reasoning.geminiThinkingLevel;
         let systemInstruction = "";
         const contents: { role: string; parts: any[] }[] = [];
 
@@ -491,7 +603,7 @@ export class GeminiProvider extends BaseAIProvider {
         if (this.oauthManager && this.config.oauthTokens && (this.isGoogleOnePreferred || !isQuotaExhausted)) {
             try {
                 const accessToken = await this.oauthManager.getValidAccessToken(this.config.oauthTokens);
-                return await this.promptViaOAuth(systemInstruction, contents, accessToken, actualModel, thinkingLevel);
+                return await this.promptViaOAuth(systemInstruction, contents, accessToken, actualModel, effectiveThinkingLevel);
             } catch (oauthErr: any) {
                 if (oauthErr.message?.includes("429") || oauthErr.message?.includes("quota") || oauthErr.message?.includes("RESOURCE_EXHAUSTED")) {
                     googleOneQuotaResetTimes.set(actualModel, Date.now() + 3600 * 1000);
@@ -513,9 +625,9 @@ export class GeminiProvider extends BaseAIProvider {
             systemInstruction: systemInstruction || undefined
         };
 
-        if (thinkingLevel && thinkingLevel !== "none") {
+        if (effectiveThinkingLevel && effectiveThinkingLevel !== "none") {
             modelParams.generationConfig = {
-                thinkingConfig: { thinkingLevel }
+                thinkingConfig: { thinkingLevel: effectiveThinkingLevel }
             };
         }
 
@@ -588,8 +700,15 @@ export class GeminiProvider extends BaseAIProvider {
         };
     }
 
-    async promptStream(history: ChatHistoryItem[], userPrompt: string, onToken: TokenCallback): Promise<ProviderResponse> {
+    async promptStream(
+        history: ChatHistoryItem[],
+        userPrompt: string,
+        onToken: TokenCallback,
+        options?: ProviderPromptOptions
+    ): Promise<ProviderResponse> {
         const [actualModel, thinkingLevel] = this.model.split(":");
+        const reasoning = this.getEffectiveReasoning(thinkingLevel, options);
+        const effectiveThinkingLevel = reasoning.geminiThinkingLevel;
         let systemInstruction = "";
         const contents: { role: string; parts: any[] }[] = [];
 
@@ -610,7 +729,7 @@ export class GeminiProvider extends BaseAIProvider {
         if (this.oauthManager && this.config.oauthTokens && (this.isGoogleOnePreferred || !isQuotaExhausted)) {
             try {
                 const accessToken = await this.oauthManager.getValidAccessToken(this.config.oauthTokens);
-                return await this.promptStreamViaOAuth(systemInstruction, contents, accessToken, actualModel, onToken, thinkingLevel);
+                return await this.promptStreamViaOAuth(systemInstruction, contents, accessToken, actualModel, onToken, effectiveThinkingLevel);
             } catch (oauthErr: any) {
                 if (oauthErr.message?.includes("429") || oauthErr.message?.includes("quota") || oauthErr.message?.includes("RESOURCE_EXHAUSTED")) {
                     googleOneQuotaResetTimes.set(actualModel, Date.now() + 3600 * 1000);
@@ -632,9 +751,9 @@ export class GeminiProvider extends BaseAIProvider {
             systemInstruction: systemInstruction || undefined
         };
 
-        if (thinkingLevel && thinkingLevel !== "none") {
+        if (effectiveThinkingLevel && effectiveThinkingLevel !== "none") {
             modelParams.generationConfig = {
-                thinkingConfig: { thinkingLevel }
+                thinkingConfig: { thinkingLevel: effectiveThinkingLevel }
             };
         }
 
@@ -781,8 +900,9 @@ export class LMStudioProvider extends BaseAIProvider {
         this.model = model || "local-model";
     }
 
-    async prompt(history: ChatHistoryItem[], userPrompt: string): Promise<ProviderResponse> {
-        const [actualModel] = this.model.split(":");
+    async prompt(history: ChatHistoryItem[], userPrompt: string, options?: ProviderPromptOptions): Promise<ProviderResponse> {
+        const [actualModel, thinkingSuffix] = this.model.split(":");
+        const reasoning = this.getEffectiveReasoning(thinkingSuffix, options);
         const messages: { role: string; content: any }[] = [];
 
         for (const item of history) {
@@ -795,11 +915,19 @@ export class LMStudioProvider extends BaseAIProvider {
         }
 
         const endpoint = `${this.baseUrl}/chat/completions`;
-        const payload = {
+        const payload: Record<string, any> = {
             model: actualModel || "local-model",
             messages,
             stream: false
         };
+        if (options?.reasoningMode !== undefined || thinkingSuffix || this.defaultReasoningMode) {
+            payload.reasoning_effort = reasoning.openaiEffort || "none";
+            if (reasoning.mode !== "none") {
+                payload.reasoning_level = reasoning.mode;
+            } else {
+                payload.max_reasoning_tokens = 0;
+            }
+        }
 
         const res = await fetch(endpoint, {
             method: "POST",
@@ -827,8 +955,14 @@ export class LMStudioProvider extends BaseAIProvider {
         };
     }
 
-    async promptStream(history: ChatHistoryItem[], userPrompt: string, onToken: TokenCallback): Promise<ProviderResponse> {
-        const [actualModel] = this.model.split(":");
+    async promptStream(
+        history: ChatHistoryItem[],
+        userPrompt: string,
+        onToken: TokenCallback,
+        options?: ProviderPromptOptions
+    ): Promise<ProviderResponse> {
+        const [actualModel, thinkingSuffix] = this.model.split(":");
+        const reasoning = this.getEffectiveReasoning(thinkingSuffix, options);
         const messages: { role: string; content: any }[] = [];
 
         for (const item of history) {
@@ -841,11 +975,19 @@ export class LMStudioProvider extends BaseAIProvider {
         }
 
         const endpoint = `${this.baseUrl}/chat/completions`;
-        const payload = {
+        const payload: Record<string, any> = {
             model: actualModel || "local-model",
             messages,
             stream: true
         };
+        if (options?.reasoningMode !== undefined || thinkingSuffix || this.defaultReasoningMode) {
+            payload.reasoning_effort = reasoning.openaiEffort || "none";
+            if (reasoning.mode !== "none") {
+                payload.reasoning_level = reasoning.mode;
+            } else {
+                payload.max_reasoning_tokens = 0;
+            }
+        }
 
         const res = await fetch(endpoint, {
             method: "POST",
@@ -922,8 +1064,9 @@ export class CustomOpenAIProvider extends BaseAIProvider {
         this.model = model || "local-model";
     }
 
-    async prompt(history: ChatHistoryItem[], userPrompt: string): Promise<ProviderResponse> {
-        const [actualModel] = this.model.split(":");
+    async prompt(history: ChatHistoryItem[], userPrompt: string, options?: ProviderPromptOptions): Promise<ProviderResponse> {
+        const [actualModel, thinkingSuffix] = this.model.split(":");
+        const reasoning = this.getEffectiveReasoning(thinkingSuffix, options);
         const messages: { role: string; content: any }[] = [];
 
         for (const item of history) {
@@ -936,11 +1079,19 @@ export class CustomOpenAIProvider extends BaseAIProvider {
         }
 
         const endpoint = `${this.baseUrl}/chat/completions`;
-        const payload = {
+        const payload: Record<string, any> = {
             model: actualModel || "local-model",
             messages,
             stream: false
         };
+        if (options?.reasoningMode !== undefined || thinkingSuffix || this.defaultReasoningMode) {
+            payload.reasoning_effort = reasoning.openaiEffort || "none";
+            if (reasoning.mode !== "none") {
+                payload.reasoning_level = reasoning.mode;
+            } else {
+                payload.max_reasoning_tokens = 0;
+            }
+        }
 
         const headers: Record<string, string> = { "Content-Type": "application/json" };
         if (this.apiKey) headers["Authorization"] = `Bearer ${this.apiKey}`;
@@ -971,8 +1122,14 @@ export class CustomOpenAIProvider extends BaseAIProvider {
         };
     }
 
-    async promptStream(history: ChatHistoryItem[], userPrompt: string, onToken: TokenCallback): Promise<ProviderResponse> {
-        const [actualModel] = this.model.split(":");
+    async promptStream(
+        history: ChatHistoryItem[],
+        userPrompt: string,
+        onToken: TokenCallback,
+        options?: ProviderPromptOptions
+    ): Promise<ProviderResponse> {
+        const [actualModel, thinkingSuffix] = this.model.split(":");
+        const reasoning = this.getEffectiveReasoning(thinkingSuffix, options);
         const messages: { role: string; content: any }[] = [];
 
         for (const item of history) {
@@ -985,11 +1142,19 @@ export class CustomOpenAIProvider extends BaseAIProvider {
         }
 
         const endpoint = `${this.baseUrl}/chat/completions`;
-        const payload = {
+        const payload: Record<string, any> = {
             model: actualModel || "local-model",
             messages,
             stream: true
         };
+        if (options?.reasoningMode !== undefined || thinkingSuffix || this.defaultReasoningMode) {
+            payload.reasoning_effort = reasoning.openaiEffort || "none";
+            if (reasoning.mode !== "none") {
+                payload.reasoning_level = reasoning.mode;
+            } else {
+                payload.max_reasoning_tokens = 0;
+            }
+        }
 
         const headers: Record<string, string> = { "Content-Type": "application/json" };
         if (this.apiKey) headers["Authorization"] = `Bearer ${this.apiKey}`;
